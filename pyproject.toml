@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-oauth-proxy"
+version = "0.1.0"
+description = "Local OpenAI-compatible proxy backed by Hermes Codex OAuth credentials."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "httpx>=0.28.1,<1",
+  "PyYAML>=6.0.3,<7",
+]
+
+[project.scripts]
+codex-oauth-proxy = "codex_oauth_proxy:main"
+
+[tool.setuptools]
+py-modules = ["codex_oauth_proxy"]
