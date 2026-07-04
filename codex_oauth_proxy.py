@@ -9,6 +9,7 @@ import os
 import sys
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -60,6 +61,48 @@ REASONING_SUFFIXES = {
 }
 
 AUTO_SYNC_CLI_AUTH = os.getenv("CODEX_PROXY_AUTO_SYNC_CLI_AUTH", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _parse_codex_homes(raw: str | None) -> list[str]:
+    """Split a comma/os.pathsep-separated list of Codex home dirs into expanded paths."""
+    if not raw:
+        return []
+    parts = raw.replace(os.pathsep, ",").split(",")
+    return [str(Path(p.strip()).expanduser()) for p in parts if p.strip()]
+
+
+# Codex CLI auth dirs the proxy imports / auto-syncs from, one per account you
+# want to flip between. Override via CODEX_PROXY_CODEX_HOMES (comma-separated) or
+# one/more --codex-home flags. Each dir is a separate Codex login
+# (`CODEX_HOME=<dir> codex login`).
+_DEFAULT_CODEX_HOMES = "~/.codex,~/.codex-acct-jonas"
+CODEX_HOME_DIRS: list[str] = _parse_codex_homes(
+    os.getenv("CODEX_PROXY_CODEX_HOMES") or _DEFAULT_CODEX_HOMES
+)
+
+# Auto-sync each Codex login dir at most once per this interval, and stagger the
+# dirs evenly across it so two accounts never refresh in the same window (e.g.
+# 6h interval + 2 dirs => each dir every 6h, 3h apart). Override via
+# CODEX_PROXY_SYNC_INTERVAL_SECONDS.
+CODEX_SYNC_INTERVAL_SECONDS = int(os.getenv("CODEX_PROXY_SYNC_INTERVAL_SECONDS", str(6 * 3600)))
+_LAST_SYNC: dict[str, float] = {}
+
+
+@contextmanager
+def _codex_home_env(codex_home: str | None):
+    """Temporarily point hermes' Codex CLI reader at a specific login dir."""
+    if not codex_home:
+        yield
+        return
+    prev = os.environ.get("CODEX_HOME")
+    os.environ["CODEX_HOME"] = str(Path(codex_home).expanduser())
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop("CODEX_HOME", None)
+        else:
+            os.environ["CODEX_HOME"] = prev
 
 
 def _b(obj: object) -> bytes:
@@ -127,6 +170,42 @@ def _jwt_account_id(token: str) -> str:
     return str(_jwt_identity(token).get("account_id") or "")
 
 
+def _jwt_user_key(token: str) -> str:
+    """Stable per-USER identity for a token. chatgpt_account_id is the
+    workspace/org (shared by every member of a Team), so it must NOT be used to
+    tell two logins apart — key on the user instead."""
+    ident = _jwt_identity(token)
+    return str(ident.get("user_id") or ident.get("subject") or "")
+
+
+def _label_for_home(codex_home: str | None) -> str | None:
+    """Derive a readable default label from a Codex login dir, e.g.
+    ~/.codex-acct-jonas -> 'codex-acct-jonas'."""
+    if not codex_home:
+        return None
+    base = Path(codex_home).expanduser().name.lstrip(".")
+    return base or None
+
+
+def _identity_summary(token: str) -> str:
+    """Human-readable 'who is this' suffix decoded from the token, e.g.
+    'Jane Doe <jane@acme.com>, plan=pro'. Empty string if nothing is known."""
+    ident = _jwt_identity(token)
+    name = ident.get("name") or ident.get("account_name") or ""
+    email = ident.get("email", "")
+    plan = ident.get("plan_type", "")
+    who = name
+    if email:
+        who = f"{name} <{email}>" if name else email
+    bits = [b for b in (who, f"plan={plan}" if plan else "") if b]
+    return ", ".join(bits)
+
+
+def _with_identity(message: str, token: str) -> str:
+    summary = _identity_summary(token)
+    return f"{message} — {summary}" if summary else message
+
+
 def _jwt_identity(token: str) -> dict[str, str]:
     try:
         from hermes_cli.auth import _decode_jwt_claims
@@ -151,10 +230,16 @@ def _jwt_identity(token: str) -> dict[str, str]:
 
 def _matches(entry: object, selector: str) -> bool:
     wanted = selector.strip().lower()
+    token = str(getattr(entry, "access_token", "") or "")
+    ident = _jwt_identity(token)
+    # account_id (org) is intentionally last and ambiguous across Team members;
+    # prefer id/label/user_id to target an individual login.
     vals = [
         getattr(entry, "id", ""),
         getattr(entry, "label", ""),
-        _jwt_account_id(str(getattr(entry, "access_token", "") or "")),
+        ident.get("user_id", ""),
+        ident.get("email", ""),
+        ident.get("account_id", ""),
     ]
     return any(isinstance(v, str) and v.strip().lower() == wanted for v in vals)
 
@@ -216,38 +301,56 @@ def resolve_cred(account: str | None = None) -> Cred:
 
 
 def resolve_creds(account: str | None = None, order: str | None = None) -> list[Cred]:
+    """Ordered list of creds to try for one request, primary first.
+
+    The explicitly chosen account(s) lead; every other currently-available
+    account is queued behind them so a 429/401/403 on the primary rolls over to
+    the next login mid-request. Accounts already in exhaustion cooldown are
+    excluded by `_available_entries`, so once a 429 marks one exhausted the next
+    account is preferred until its credits reset.
+    """
     from agent.credential_pool import load_pool
 
     _auto_sync_codex_cli_auth()
     selectors = _selectors(order)
     if account and account not in selectors:
         selectors.insert(0, account)
-    if not selectors:
-        return [resolve_cred(None)]
-    pool = load_pool("openai-codex")
-    available = pool._available_entries(clear_expired=True, refresh=True)
-    picked, seen = [], set()
-    for selector in selectors:
-        entry = next((e for e in available if _matches(e, selector) and e.id not in seen), None)
-        if entry is not None:
+
+    def snapshot() -> list[Cred]:
+        pool = load_pool("openai-codex")
+        available = pool._available_entries(clear_expired=True, refresh=True)
+        picked: list[Cred] = []
+        seen: set[str] = set()
+
+        def take(entry: object) -> None:
             pool.acquire_lease(entry.id)
             picked.append(_cred_from_entry(entry))
             seen.add(entry.id)
-    if not picked:
-        if _auto_sync_codex_cli_auth():
-            pool = load_pool("openai-codex")
-            available = pool._available_entries(clear_expired=True, refresh=True)
-            for selector in selectors:
-                entry = next((e for e in available if _matches(e, selector) and e.id not in seen), None)
-                if entry is not None:
-                    pool.acquire_lease(entry.id)
-                    picked.append(_cred_from_entry(entry))
-                    seen.add(entry.id)
-        if picked:
-            return picked
-        known = ", ".join(f"{e.label or e.id} ({e.id})" for e in pool.entries()) or "none"
+
+        for selector in selectors:
+            entry = next((e for e in available if _matches(e, selector) and e.id not in seen), None)
+            if entry is not None:
+                take(entry)
+        if not selectors:
+            primary = pool.select()
+            if primary is not None and primary.id not in seen:
+                take(primary)
+        for entry in available:
+            if entry.id not in seen:
+                take(entry)
+        return picked
+
+    picked = snapshot()
+    if not picked and _auto_sync_codex_cli_auth(force=True):
+        picked = snapshot()
+    if picked:
+        return picked
+
+    pool = load_pool("openai-codex")
+    known = ", ".join(f"{e.label or e.id} ({e.id})" for e in pool.entries()) or "none"
+    if selectors:
         raise RuntimeError(f"No available Codex account matching order {selectors!r}. Known: {known}")
-    return picked
+    raise RuntimeError("No Codex credentials. Run `hermes auth add openai-codex`.")
 
 
 def error_context(message: str) -> dict[str, Any]:
@@ -275,15 +378,17 @@ def mark_exhausted(c: Cred, status: int, message: str = "") -> None:
         pool._mark_exhausted(entry, status, error_context(message))
 
 
-def import_codex_cli_auth(label: str | None = None) -> str:
+def import_codex_cli_auth(label: str | None = None, codex_home: str | None = None) -> str:
     from agent.credential_pool import AUTH_TYPE_OAUTH, PooledCredential, label_from_token, load_pool
     from hermes_cli.auth import DEFAULT_CODEX_BASE_URL, _import_codex_cli_tokens, _save_codex_tokens
 
-    tokens = _import_codex_cli_tokens()
+    with _codex_home_env(codex_home):
+        tokens = _import_codex_cli_tokens()
     if not tokens:
-        raise RuntimeError("No usable Codex CLI auth found at $CODEX_HOME/auth.json or ~/.codex/auth.json")
+        where = codex_home or os.getenv("CODEX_HOME") or "~/.codex"
+        raise RuntimeError(f"No usable Codex CLI auth found at {where}/auth.json")
     pool = load_pool("openai-codex")
-    account_id = _jwt_account_id(tokens["access_token"])
+    user_key = _jwt_user_key(tokens["access_token"])
     refresh_token = tokens.get("refresh_token")
     for entry in pool.entries():
         same_pair = entry.access_token == tokens["access_token"] or (
@@ -303,17 +408,25 @@ def import_codex_cli_auth(label: str | None = None) -> str:
             )
             pool._replace_entry(entry, updated)
             pool._persist()
-            return f"Codex CLI auth refreshed for {updated.label!r} ({updated.id})"
-        return f"Codex CLI auth already present as {entry.label!r} ({entry.id})"
+            return _with_identity(f"Codex CLI auth refreshed for {updated.label!r} ({updated.id})", updated.access_token)
+        return _with_identity(f"Codex CLI auth already present as {entry.label!r} ({entry.id})", entry.access_token)
 
-    manual_import = next(
-        (
-            entry for entry in pool.entries()
-            if (entry.source or "") == "manual:codex_cli_import"
-            or (account_id and _jwt_account_id(entry.access_token) == account_id)
-        ),
-        None,
-    )
+    # Match the entry to update by USER (not the org account_id, which every
+    # Team member shares) so importing a different user creates its own entry
+    # instead of clobbering an existing one. Fall back to the source marker only
+    # when the token carries no decodable user identity.
+    if user_key:
+        manual_import = next(
+            (entry for entry in pool.entries()
+             if _jwt_user_key(entry.access_token) == user_key),
+            None,
+        )
+    else:
+        manual_import = next(
+            (entry for entry in pool.entries()
+             if (entry.source or "") == "manual:codex_cli_import"),
+            None,
+        )
     if manual_import is not None:
         updated = replace(
             manual_import,
@@ -332,9 +445,13 @@ def import_codex_cli_auth(label: str | None = None) -> str:
         pool._replace_entry(manual_import, updated)
         pool._persist()
         _save_codex_tokens(tokens)
-        return f"Updated Codex CLI auth for {updated.label!r} ({updated.id})"
+        return _with_identity(f"Updated Codex CLI auth for {updated.label!r} ({updated.id})", updated.access_token)
 
-    name = label or label_from_token(tokens["access_token"], f"codex-cli-{len(pool.entries()) + 1}")
+    name = (
+        label
+        or _label_for_home(codex_home)
+        or label_from_token(tokens["access_token"], f"codex-cli-{len(pool.entries()) + 1}")
+    )
     entry = PooledCredential(
         provider="openai-codex",
         id=uuid.uuid4().hex[:6],
@@ -348,7 +465,7 @@ def import_codex_cli_auth(label: str | None = None) -> str:
     )
     added = pool.add_entry(entry)
     _save_codex_tokens(tokens)
-    return f"Imported Codex CLI auth as {added.label!r} ({added.id})"
+    return _with_identity(f"Imported Codex CLI auth as {added.label!r} ({added.id})", added.access_token)
 
 
 def authenticate_codex_oauth(label: str | None = None) -> str:
@@ -362,11 +479,11 @@ def authenticate_codex_oauth(label: str | None = None) -> str:
     access_token = tokens["access_token"]
     refresh_token = tokens.get("refresh_token")
     pool = load_pool("openai-codex")
-    account_id = _jwt_account_id(access_token)
+    user_key = _jwt_user_key(access_token)
     name = label or label_from_token(access_token, f"codex-oauth-{len(pool.entries()) + 1}")
 
     for entry in pool.entries():
-        same_account = account_id and _jwt_account_id(entry.access_token) == account_id
+        same_account = user_key and _jwt_user_key(entry.access_token) == user_key
         same_refresh = refresh_token and entry.refresh_token == refresh_token
         if not (same_account or same_refresh):
             continue
@@ -388,7 +505,7 @@ def authenticate_codex_oauth(label: str | None = None) -> str:
         )
         pool._replace_entry(entry, updated)
         pool._persist()
-        return f"Updated Codex OAuth auth for {updated.label!r} ({updated.id})"
+        return _with_identity(f"Updated Codex OAuth auth for {updated.label!r} ({updated.id})", updated.access_token)
 
     entry = PooledCredential(
         provider="openai-codex",
@@ -403,7 +520,7 @@ def authenticate_codex_oauth(label: str | None = None) -> str:
         last_refresh=creds.get("last_refresh"),
     )
     added = pool.add_entry(entry)
-    return f"Added Codex OAuth auth as {added.label!r} ({added.id})"
+    return _with_identity(f"Added Codex OAuth auth as {added.label!r} ({added.id})", added.access_token)
 
 
 def _oauth_entry_stale_reason(entry: object) -> str | None:
@@ -541,6 +658,8 @@ def check_credentials() -> list[dict[str, Any]]:
             "label": getattr(entry, "label", "") or getattr(entry, "id", ""),
             "email": ident.get("email", ""),
             "account_id": ident.get("account_id", ""),
+            "name": ident.get("name", "") or ident.get("account_name", ""),
+            "plan_type": ident.get("plan_type", ""),
         }
         record.update(_probe_entry(pool, entry))
         out.append(record)
@@ -550,8 +669,12 @@ def check_credentials() -> list[dict[str, Any]]:
 def _format_health_record(rec: dict[str, Any]) -> str:
     head = f"{rec.get('label') or rec.get('id')} ({rec.get('id')})"
     bits = [f"health={rec.get('health')}"]
+    if rec.get("name"):
+        bits.append(f"name={rec['name']}")
     if rec.get("email"):
         bits.append(f"email={rec['email']}")
+    if rec.get("plan_type"):
+        bits.append(f"plan={rec['plan_type']}")
     if rec.get("http_status") is not None:
         bits.append(f"http={rec['http_status']}")
     if rec.get("code"):
@@ -629,16 +752,39 @@ def prune_credentials(*, assume_yes: bool = False) -> str:
     return f"Deleted {removed} Codex credential(s): {deleted_labels}"
 
 
-def _auto_sync_codex_cli_auth() -> bool:
+def _sync_due(key: str, index: int, count: int, now: float) -> bool:
+    """Throttle + stagger: each dir syncs at most once per interval, and dir
+    `index` is offset by index*(interval/count) so dirs never sync together."""
+    interval = max(0, CODEX_SYNC_INTERVAL_SECONDS)
+    if not interval:
+        return True
+    last = _LAST_SYNC.get(key)
+    if last is None:
+        # Seed so dir 0 is due immediately and dir i waits i*(interval/count)
+        # before its first sync — establishing the staggered cadence.
+        last = _LAST_SYNC[key] = now - interval + (interval * index) / (count or 1)
+    return (now - last) >= interval
+
+
+def _auto_sync_codex_cli_auth(force: bool = False) -> bool:
     if not AUTO_SYNC_CLI_AUTH:
         return False
-    try:
-        message = import_codex_cli_auth()
-    except Exception as exc:
-        debug(f"auto-sync codex auth skipped: {exc}")
-        return False
-    debug(f"auto-sync codex auth: {message}")
-    return True
+    homes = CODEX_HOME_DIRS or [None]
+    now = time.time()
+    synced = False
+    for index, home in enumerate(homes):
+        key = home or "default"
+        if not force and not _sync_due(key, index, len(homes), now):
+            continue
+        try:
+            message = import_codex_cli_auth(codex_home=home)
+        except Exception as exc:
+            debug(f"auto-sync codex auth skipped for {key}: {exc}")
+            continue
+        _LAST_SYNC[key] = now
+        debug(f"auto-sync codex auth ({key}): {message}")
+        synced = True
+    return synced
 
 
 def accounts() -> list[dict[str, object]]:
@@ -679,12 +825,16 @@ def select_account_interactively() -> str:
     print("Available Codex accounts:", file=sys.stderr)
     for idx, acct in enumerate(available, start=1):
         details = [acct.get("label") or acct.get("id"), f"id={acct.get('id')}"]
+        if acct.get("name"):
+            details.append(f"name={acct['name']}")
         if acct.get("email"):
             details.append(f"email={acct['email']}")
         if acct.get("account_name"):
             details.append(f"account={acct['account_name']}")
         elif acct.get("account_id"):
             details.append(f"account_id={acct['account_id']}")
+        if acct.get("plan_type"):
+            details.append(f"plan={acct['plan_type']}")
         print(f"  {idx}. " + " | ".join(str(part) for part in details if part), file=sys.stderr)
 
     while True:
@@ -1020,7 +1170,8 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "codex-oauth-proxy/0.2"
 
     def log_message(self, fmt: str, *args: object) -> None:
-        sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        sys.stderr.write("%s %s - %s\n" % (ts, self.address_string(), fmt % args))
 
     def json(self, status: int, obj: object, extra: dict[str, str] | None = None) -> None:
         body = _b(obj)
@@ -1212,6 +1363,7 @@ def main() -> int:
     p.add_argument("--serve-after-auth", action="store_true", help="Start the proxy after --codex-oauth-auth")
     p.add_argument("--import-only", action="store_true", help="Deprecated alias for --import-codex-auth")
     p.add_argument("--label", help="Label for imported Codex CLI auth")
+    p.add_argument("--codex-home", action="append", metavar="DIR", help="Codex CLI login dir to import/auto-sync from (repeatable). Overrides CODEX_PROXY_CODEX_HOMES. Default: $CODEX_HOME or ~/.codex")
     p.add_argument("--no-auto-sync-codex-cli-auth", action="store_true", help="Do not auto-copy Codex CLI auth while serving")
     p.add_argument("--remove-stale-oauth-configs", action="store_true", help="Remove stale Codex OAuth credentials from the Hermes pool and exit")
     p.add_argument("--dry-run", action="store_true", help="Show what --remove-stale-oauth-configs would remove")
@@ -1221,6 +1373,8 @@ def main() -> int:
     args = p.parse_args()
     if args.no_auto_sync_codex_cli_auth:
         AUTO_SYNC_CLI_AUTH = False
+    if args.codex_home:
+        CODEX_HOME_DIRS[:] = [str(Path(d).expanduser()) for d in args.codex_home]
     if args.remove_stale_oauth_configs:
         print(remove_stale_oauth_configs(dry_run=args.dry_run), file=sys.stderr)
         return 0
@@ -1235,7 +1389,12 @@ def main() -> int:
     if args.codex_oauth_auth and not args.serve_after_auth:
         return 0
     if args.import_codex_auth or args.import_only:
-        print(import_codex_cli_auth(args.label), file=sys.stderr)
+        homes = CODEX_HOME_DIRS or [None]
+        for home in homes:
+            # A single --label is ambiguous across multiple dirs, so only apply it
+            # when importing from exactly one.
+            label = args.label if len(homes) == 1 else None
+            print(import_codex_cli_auth(label, codex_home=home), file=sys.stderr)
     if (args.import_codex_auth or args.import_only) and not args.serve_after_import:
         return 0
     if args.select_account:
