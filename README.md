@@ -4,6 +4,9 @@
 
 It is useful when a local tool expects an OpenAI-style `base_url` and `api_key`, but you want requests to go through Codex OAuth accounts stored in Hermes.
 
+It also serves Grok Build: send `"model": "grok"` and the request goes to your
+`grok` CLI subscription instead of Codex. See [Grok Build](#grok-build).
+
 ## Start The Proxy
 
 ```bash
@@ -257,6 +260,87 @@ curl http://127.0.0.1:8765/v1/chat/completions \
 
 The chat completions wrapper is non-streaming. Use `/v1/responses` for streaming.
 
+## Grok Build
+
+Pass `grok` as the model and the proxy routes the request to Grok Build's own
+backend instead of Codex:
+
+```bash
+curl http://127.0.0.1:8765/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"grok","messages":[{"role":"user","content":"Reply exactly: grok-ok"}]}'
+```
+
+Any model name starting with `grok` routes there. Bare `grok` and `grok-build`
+resolve to `grok-4.5`; anything else is passed through as given.
+
+Credentials come from the `grok` CLI's own login file (`~/.grok/auth.json`,
+written by `grok login`) — not from the Hermes credential pool. Nothing needs to
+be imported: the file is read fresh on each request, so a token the `grok` CLI
+refreshed underneath the proxy is picked up automatically. When the token is
+within `GROK_PROXY_REFRESH_SKEW_SECONDS` of expiry the proxy refreshes it itself
+and writes the new pair back to `auth.json`, so a long-running proxy keeps
+working without you touching the CLI. Write-back is necessary because xAI may
+rotate the refresh token, which would otherwise leave the `grok` CLI holding a
+dead one. Set `GROK_PROXY_AUTO_REFRESH=0` to never write to `auth.json`; the
+proxy then works until the token expires and you re-run `grok login`.
+
+The first write copies the original file to `auth.json.proxy-bak`. That is a
+one-shot snapshot guarding the first write only — it is not refreshed
+afterwards, so it goes stale and is not a general restore point. If Grok auth
+ever breaks, `grok login` is the fix.
+
+Both `/v1/responses` and `/v1/chat/completions` are supported, streaming and
+non-streaming — Grok Build implements both natively, so bodies pass through
+untouched apart from the model alias and the `model(effort)` suffix:
+
+```bash
+curl -N http://127.0.0.1:8765/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"grok(high)","input":"hello","stream":true}'
+```
+
+Grok advertises only `high`, `medium`, and `low` effort, so `minimal` clamps to
+`low`, `xhigh`/`max` clamp to `high`, and `none`/`auto` are dropped.
+
+Grok responses carry `X-Proxy-Backend: grok` and `X-Proxy-Account: <email>`.
+
+Multiple Grok logins work the same way as the Codex ones — each is a separate
+`GROK_HOME=<dir> grok login`:
+
+```bash
+python codex_oauth_proxy.py --port 8765 --grok-home ~/.grok --grok-home ~/.grok-acct-work
+```
+
+The first is the default; select another per request with `X-Grok-Home`. That
+header takes any login dir, so `--grok-home` only sets which one is used by
+default — it is not an allowlist. Unlike Codex there is no pool behind Grok, so
+there is no automatic failover between Grok accounts — upstream errors go
+straight back to the client.
+
+To force a backend regardless of the model name, send `X-Proxy-Backend: grok`
+or `X-Proxy-Backend: codex` (or `?backend=grok`). This is also how to list Grok
+models, since a `GET` carries no model:
+
+```bash
+curl 'http://127.0.0.1:8765/v1/models?backend=grok'
+```
+
+Grok settings:
+
+```text
+GROK_PROXY_GROK_HOMES           comma-separated login dirs (default: $GROK_HOME or ~/.grok)
+GROK_PROXY_DEFAULT_MODEL        what bare `grok` resolves to (default: grok-4.5)
+GROK_PROXY_BASE_URL             upstream (default: https://cli-chat-proxy.grok.com/v1)
+GROK_PROXY_CLIENT_VERSION       client version sent upstream (default: 0.2.112)
+GROK_PROXY_AUTO_REFRESH=0       never refresh/write the grok token
+GROK_PROXY_REFRESH_SKEW_SECONDS refresh this long before expiry (default: 300)
+```
+
+Grok Build gates on a client-version header; if the backend starts answering
+`426 ... version (none) is outdated`, set `GROK_PROXY_CLIENT_VERSION` to your
+installed version (`grok --version`).
+
 ## OpenAI SDK Example
 
 ```python
@@ -294,6 +378,9 @@ curl http://127.0.0.1:8765/health \
 ## Notes
 
 - The proxy reuses Hermes Codex OAuth handling and credential pool state.
+- Codex and Grok Build are separate backends. Grok requests never touch the
+  Hermes pool, and the Codex normalization below does not apply to them; they
+  work even when no Codex credentials are configured at all.
 - Request fields unsupported by the Codex backend, such as `temperature`, `top_p`, and token limit fields, are stripped before forwarding.
 - `system` and `developer` input messages are lifted into Responses `instructions`.
 - The proxy backfills empty final output from streamed `response.output_item.done` events, matching Hermes' Codex stream recovery behavior.

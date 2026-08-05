@@ -11,6 +11,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Iterable
@@ -24,6 +25,22 @@ DEBUG = os.getenv("CODEX_PROXY_DEBUG", "").strip().lower() in {"1", "true", "yes
 def debug(msg: str) -> None:
     if DEBUG:
         print(msg, file=sys.stderr, flush=True)
+
+
+def _load_dotenv(path: Path) -> None:
+    if not path.is_file():
+        return
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        os.environ.setdefault(key, value)
+
+
+_load_dotenv(Path(__file__).resolve().parent / ".env")
 
 
 def _find_hermes_root() -> Path:
@@ -62,6 +79,13 @@ REASONING_SUFFIXES = {
 
 AUTO_SYNC_CLI_AUTH = os.getenv("CODEX_PROXY_AUTO_SYNC_CLI_AUTH", "1").strip().lower() not in {"0", "false", "no", "off"}
 
+# When set, a request only ever uses the explicitly selected account(s) (via
+# --account/--select-account/--account-order or the X-Hermes-Codex-Account
+# header). The usual "queue every other account behind the primary as failover"
+# step is skipped, so an error from the chosen account surfaces to the client
+# instead of silently rolling over to a different login.
+NO_FAILOVER = os.getenv("CODEX_PROXY_NO_FAILOVER", "").strip().lower() in {"1", "true", "yes", "on"}
+
 
 def _parse_codex_homes(raw: str | None) -> list[str]:
     """Split a comma/os.pathsep-separated list of Codex home dirs into expanded paths."""
@@ -75,7 +99,7 @@ def _parse_codex_homes(raw: str | None) -> list[str]:
 # want to flip between. Override via CODEX_PROXY_CODEX_HOMES (comma-separated) or
 # one/more --codex-home flags. Each dir is a separate Codex login
 # (`CODEX_HOME=<dir> codex login`).
-_DEFAULT_CODEX_HOMES = "~/.codex,~/.codex-acct-jonas"
+_DEFAULT_CODEX_HOMES = "~/.codex,~/.codex-acct-jonas,~/.codex-acct-nives"
 CODEX_HOME_DIRS: list[str] = _parse_codex_homes(
     os.getenv("CODEX_PROXY_CODEX_HOMES") or _DEFAULT_CODEX_HOMES
 )
@@ -86,6 +110,41 @@ CODEX_HOME_DIRS: list[str] = _parse_codex_homes(
 # CODEX_PROXY_SYNC_INTERVAL_SECONDS.
 CODEX_SYNC_INTERVAL_SECONDS = int(os.getenv("CODEX_PROXY_SYNC_INTERVAL_SECONDS", str(6 * 3600)))
 _LAST_SYNC: dict[str, float] = {}
+
+# --------------------------------------------------------------- Grok Build --
+# `grok login` signs in with the same auth.x.ai OAuth client Hermes uses for its
+# `xai-oauth` provider, but Grok Build sends that bearer to its OWN subscription
+# backend (cli-chat-proxy) rather than to api.x.ai — different resource server,
+# different model catalogue. So Grok requests bypass the Hermes credential pool
+# entirely and read `grok`'s auth file directly.
+#
+# cli-chat-proxy gates on a client-version header trio; without it every call
+# answers 426 "Your Grok CLI version (none) is outdated". Bump
+# GROK_PROXY_CLIENT_VERSION if the backend starts rejecting this one.
+GROK_BASE_URL = (os.getenv("GROK_PROXY_BASE_URL") or "https://cli-chat-proxy.grok.com/v1").rstrip("/")
+GROK_CLIENT_VERSION = os.getenv("GROK_PROXY_CLIENT_VERSION") or "0.2.112"
+GROK_CLIENT_IDENTIFIER = os.getenv("GROK_PROXY_CLIENT_IDENTIFIER") or "xai-grok-cli"
+GROK_CLIENT_SURFACE = os.getenv("GROK_PROXY_CLIENT_SURFACE") or "grok-build"
+GROK_DEFAULT_MODEL = os.getenv("GROK_PROXY_DEFAULT_MODEL") or "grok-4.5"
+
+# Grok login dirs, same idea as CODEX_HOME_DIRS: each is a separate
+# `GROK_HOME=<dir> grok login`. Only the first is used unless a request picks
+# another with the X-Grok-Home header.
+GROK_HOME_DIRS: list[str] = _parse_codex_homes(
+    os.getenv("GROK_PROXY_GROK_HOMES") or os.getenv("GROK_HOME") or "~/.grok"
+)
+
+# Grok access tokens live ~6h. Refresh this many seconds before expiry so a
+# long-lived proxy keeps working without the user touching the `grok` CLI.
+GROK_REFRESH_SKEW_SECONDS = int(os.getenv("GROK_PROXY_REFRESH_SKEW_SECONDS", "300"))
+GROK_AUTO_REFRESH = os.getenv("GROK_PROXY_AUTO_REFRESH", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+# Bare aliases so a client can just say `"model": "grok"`.
+GROK_MODEL_ALIASES = {"grok": GROK_DEFAULT_MODEL, "grok-build": GROK_DEFAULT_MODEL}
+
+# Grok Build advertises exactly high/medium/low (models_cache.json), so the
+# wider Codex effort vocabulary is clamped into that range.
+GROK_EFFORTS = {"minimal": "low", "low": "low", "medium": "medium", "high": "high", "xhigh": "high", "max": "high"}
 
 
 @contextmanager
@@ -251,6 +310,10 @@ class Cred:
     label: str
     cid: str
     base_url: str
+    # "openai-codex" creds come from the Hermes pool and can be marked
+    # exhausted / failed over; "grok" creds are read straight from grok's own
+    # auth file and have no pool behind them.
+    provider: str = "openai-codex"
 
 
 def _selectors(raw: str | None) -> list[str]:
@@ -335,9 +398,10 @@ def resolve_creds(account: str | None = None, order: str | None = None) -> list[
             primary = pool.select()
             if primary is not None and primary.id not in seen:
                 take(primary)
-        for entry in available:
-            if entry.id not in seen:
-                take(entry)
+        if not NO_FAILOVER:
+            for entry in available:
+                if entry.id not in seen:
+                    take(entry)
         return picked
 
     picked = snapshot()
@@ -372,10 +436,125 @@ def error_context(message: str) -> dict[str, Any]:
 def mark_exhausted(c: Cred, status: int, message: str = "") -> None:
     from agent.credential_pool import load_pool
 
+    if c.provider != "openai-codex":
+        return
     pool = load_pool("openai-codex")
     entry = next((e for e in pool.entries() if e.id == c.cid), None)
     if entry is not None:
         pool._mark_exhausted(entry, status, error_context(message))
+
+
+def grok_headers() -> dict[str, str]:
+    return {
+        "x-grok-client-version": GROK_CLIENT_VERSION,
+        "x-grok-client-identifier": GROK_CLIENT_IDENTIFIER,
+        "x-grok-client-surface": GROK_CLIENT_SURFACE,
+    }
+
+
+def _grok_expires_at(entry: dict[str, Any]) -> float:
+    """Epoch seconds for a grok auth entry's `expires_at`, or 0.0 if unreadable."""
+    raw = str(entry.get("expires_at") or "").strip()
+    if not raw:
+        return 0.0
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _read_grok_auth(home: str) -> tuple[Path, str, dict[str, Any]]:
+    """Return (path, entry_key, entry) from a Grok login dir.
+
+    `grok login` writes auth.json as {"<issuer>::<client_id>": {...}} with the
+    access token under `key`, alongside `refresh_token` and `expires_at`.
+    """
+    path = Path(home).expanduser() / "auth.json"
+    if not path.is_file():
+        raise RuntimeError(f"No Grok auth at {path}. Run `grok login` (or `GROK_HOME={home} grok login`).")
+    try:
+        doc = json.loads(path.read_text() or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{path} is not valid JSON: {exc}") from exc
+    if isinstance(doc, dict):
+        for entry_key, entry in doc.items():
+            if isinstance(entry, dict) and str(entry.get("key") or "").strip():
+                return path, entry_key, entry
+    raise RuntimeError(f"{path} has no usable Grok access token. Run `grok login`.")
+
+
+def _write_grok_auth(path: Path, entry_key: str, tokens: dict[str, Any]) -> None:
+    """Persist refreshed tokens back into grok's own auth.json.
+
+    xAI may rotate the refresh token, and an in-memory-only refresh would then
+    leave the `grok` CLI holding a dead one — so the new pair has to land on
+    disk. The file is re-read immediately before the swap to keep the
+    lost-update window against a concurrently-refreshing `grok` as small as
+    possible, backed up once, and replaced atomically so a crash mid-write can
+    never leave a torn credential file.
+
+    grok's sibling auth.json.lock (PID:timestamp) is deliberately left alone:
+    its semantics are undocumented, and os.replace is already atomic.
+    """
+    backup = path.with_name(path.name + ".proxy-bak")
+    if not backup.exists():
+        backup.write_text(path.read_text())
+        os.chmod(backup, 0o600)
+    doc = json.loads(path.read_text() or "{}")
+    entry = doc.get(entry_key)
+    if not isinstance(entry, dict):
+        return
+    entry["key"] = tokens["access_token"]
+    if tokens.get("refresh_token"):
+        entry["refresh_token"] = tokens["refresh_token"]
+    if tokens.get("expires_in"):
+        expiry = datetime.fromtimestamp(time.time() + float(tokens["expires_in"]), tz=timezone.utc)
+        entry["expires_at"] = expiry.isoformat().replace("+00:00", "Z")
+    tmp = path.with_name(path.name + ".proxy-tmp")
+    tmp.write_text(json.dumps(doc, indent=2))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def grok_cred(home: str | None = None) -> Cred:
+    """Credential for the Grok Build backend, refreshed if it is about to expire.
+
+    Read fresh on every request so a token the `grok` CLI refreshed underneath
+    us is picked up automatically — the same auto-sync idea the Codex side uses,
+    but the file itself is the source of truth so there is nothing to import.
+    """
+    home = home or (GROK_HOME_DIRS[0] if GROK_HOME_DIRS else "~/.grok")
+    path, entry_key, entry = _read_grok_auth(home)
+    token = str(entry.get("key") or "").strip()
+    refresh_token = str(entry.get("refresh_token") or "").strip()
+    expires_at = _grok_expires_at(entry)
+    expiring = bool(expires_at) and expires_at - time.time() <= GROK_REFRESH_SKEW_SECONDS
+
+    if GROK_AUTO_REFRESH and refresh_token and expiring:
+        from hermes_cli.auth import refresh_xai_oauth_pure
+
+        try:
+            tokens = refresh_xai_oauth_pure(token, refresh_token)
+        except Exception as exc:
+            # Fall through with the old token: it may still have seconds left,
+            # and a real 401 from upstream is a clearer error than this one.
+            debug(f"grok token refresh failed for {path}: {exc}")
+        else:
+            token = tokens["access_token"]
+            _write_grok_auth(path, entry_key, tokens)
+            debug(f"grok token refreshed for {path}")
+
+    if not token:
+        raise RuntimeError(f"No Grok access token in {path}. Run `grok login`.")
+    label = str(entry.get("email") or "").strip() or _label_for_home(home) or "grok"
+    return Cred(
+        token=token,
+        headers=grok_headers(),
+        label=label,
+        cid=str(entry.get("user_id") or ""),
+        base_url=GROK_BASE_URL,
+        provider="grok",
+    )
 
 
 def import_codex_cli_auth(label: str | None = None, codex_home: str | None = None) -> str:
@@ -991,6 +1170,36 @@ def apply_model_suffix(req: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def is_grok_model(model: Any) -> bool:
+    """True when a request's model names Grok, e.g. `grok`, `grok-4.5`, `grok(high)`."""
+    base, _ = split_model_suffix(model)
+    return isinstance(base, str) and base.strip().lower().startswith("grok")
+
+
+def grok_normalize_request(body: dict[str, Any]) -> dict[str, Any]:
+    """Minimal request fixups for the Grok Build backend.
+
+    Unlike Codex, cli-chat-proxy speaks stock OpenAI Responses and Chat
+    Completions — it accepts `temperature`/`top_p`, needs no `store` or
+    `include` defaults, and takes `input` as either a string or a list. So the
+    body is forwarded as the client sent it apart from resolving the bare
+    `grok` alias and the `model(effort)` suffix this proxy accepts for Codex.
+    """
+    req = apply_model_suffix(body)
+    model = req.get("model")
+    if isinstance(model, str):
+        req["model"] = GROK_MODEL_ALIASES.get(model.strip().lower(), model)
+    reasoning = req.get("reasoning")
+    if isinstance(reasoning, dict) and reasoning.get("effort"):
+        effort = GROK_EFFORTS.get(str(reasoning["effort"]).strip().lower())
+        if effort:
+            req["reasoning"] = {**reasoning, "effort": effort}
+        else:
+            # "none"/"auto" have no Grok equivalent — let the backend default.
+            req.pop("reasoning", None)
+    return req
+
+
 def apply_codex_defaults(req: dict[str, Any]) -> dict[str, Any]:
     req = apply_model_suffix(req)
     out = {k: v for k, v in req.items() if k not in CODEX_DROP_FIELDS}
@@ -1189,6 +1398,24 @@ class Handler(BaseHTTPRequestHandler):
     def account_order(self) -> str | None:
         return self.headers.get("X-Hermes-Codex-Account-Order") or getattr(self.server, "account_order", None)
 
+    def wants_grok(self, model: Any = None) -> bool:
+        """Whether this request should go to Grok Build instead of Codex.
+
+        Normally decided by the model name, so a client only has to send
+        `"model": "grok"`. An explicit `X-Proxy-Backend` header (or `?backend=`)
+        overrides both ways — needed for GET /v1/models, which carries no model.
+        """
+        forced = (
+            self.headers.get("X-Proxy-Backend")
+            or dict(p.split("=", 1) for p in urlsplit(self.path).query.split("&") if "=" in p).get("backend")
+            or ""
+        ).strip().lower()
+        if forced in {"grok", "grok-build", "xai"}:
+            return True
+        if forced in {"codex", "openai-codex"}:
+            return False
+        return is_grok_model(model)
+
     def do_GET(self) -> None:
         self.route()
 
@@ -1198,7 +1425,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self) -> None:
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "http://127.0.0.1")
-        self.send_header("Access-Control-Allow-Headers", "authorization,content-type,x-hermes-codex-account,x-hermes-codex-account-order")
+        self.send_header("Access-Control-Allow-Headers", "authorization,content-type,x-hermes-codex-account,x-hermes-codex-account-order,x-proxy-backend,x-grok-home")
         self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
         self.end_headers()
 
@@ -1221,6 +1448,44 @@ class Handler(BaseHTTPRequestHandler):
             return self.pass_through(rel)
         self.json(404, {"error": {"message": f"Unsupported path {path}", "code": "path_not_allowed"}})
 
+    def grok(self, rel: str, raw: dict[str, Any] | None) -> None:
+        """Forward one request to Grok Build's own backend.
+
+        A straight proxy: cli-chat-proxy implements Responses and Chat
+        Completions natively, streaming included, so bytes pass through
+        untouched in both directions. There is no credential pool behind Grok,
+        hence no failover loop — errors go back to the client as-is.
+        """
+        try:
+            c = grok_cred(self.headers.get("X-Grok-Home"))
+            headers = _req_headers(self.headers.items())
+            headers.update(c.headers)
+            headers["Authorization"] = f"Bearer {c.token}"
+            content = None
+            if raw is not None:
+                req = grok_normalize_request(raw)
+                debug(f"upstream grok {rel} normalized={json.dumps(req, separators=(',', ':'))}")
+                content = _b(req)
+                headers["Content-Type"] = "application/json"
+            with httpx.Client(timeout=httpx.Timeout(300, connect=15)) as client:
+                url = f"{c.base_url}{rel}"
+                with client.stream(self.command, url, content=content, headers=headers, follow_redirects=False) as r:
+                    if r.status_code >= 400:
+                        r.read()
+                        debug(f"upstream {url} status={r.status_code} body={r.text}")
+                    self.send_response(r.status_code)
+                    for k, v in _resp_headers(r.headers):
+                        self.send_header(k, v)
+                    self.send_header("X-Proxy-Backend", "grok")
+                    self.send_header("X-Proxy-Account", c.label)
+                    self.end_headers()
+                    for chunk in r.iter_bytes():
+                        self.wfile.write(chunk)
+        except BrokenPipeError:
+            return
+        except Exception as e:
+            self.json(502, {"error": {"message": str(e), "code": "grok_proxy_error"}})
+
     def upstream_headers(self, c: Cred, req: dict[str, Any] | None = None) -> dict[str, str]:
         h = _req_headers(self.headers.items())
         h.update(c.headers)
@@ -1237,10 +1502,20 @@ class Handler(BaseHTTPRequestHandler):
             req = None
             downstream_stream = False
             is_responses = _is_responses_path(rel)
-            if self.command != "GET":
+            if self.command == "GET":
+                # No body to read a model from, so only an explicit
+                # X-Proxy-Backend/?backend= override can select Grok here.
+                if self.wants_grok():
+                    return self.grok(rel, None)
+            else:
                 if is_responses:
                     raw_req = _body(self)
                     debug(f"downstream {self.command} {self.path} raw={json.dumps(raw_req, separators=(',', ':'))}")
+                    # Branch before any Codex normalization or credential-pool
+                    # lookup: Grok has its own backend, auth and request shape,
+                    # and resolve_creds() would fail on an empty Codex pool.
+                    if self.wants_grok(raw_req.get("model")):
+                        return self.grok(rel, raw_req)
                     downstream_stream = raw_req.get("stream") is True
                     req = normalize_responses_subpath_request(rel, raw_req)
                     debug(f"upstream {rel} normalized={json.dumps(req, separators=(',', ':'))}")
@@ -1295,6 +1570,10 @@ class Handler(BaseHTTPRequestHandler):
     def chat(self) -> None:
         try:
             req = _body(self)
+            # Grok speaks Chat Completions natively, so it needs neither the
+            # Responses conversion below nor a Codex credential.
+            if self.wants_grok(req.get("model")):
+                return self.grok("/chat/completions", req)
             responses_req = chat_to_responses(req)
             downstream_stream = req.get("stream") is True
             with httpx.Client(timeout=httpx.Timeout(300, connect=15)) as client:
@@ -1348,15 +1627,16 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> int:
-    global AUTO_SYNC_CLI_AUTH
+    global AUTO_SYNC_CLI_AUTH, NO_FAILOVER
 
     p = argparse.ArgumentParser(description="Local OpenAI-compatible proxy for Hermes Codex OAuth.")
     p.add_argument("--host", default=DEFAULT_HOST)
     p.add_argument("--port", type=int, default=DEFAULT_PORT)
     account_group = p.add_mutually_exclusive_group()
-    account_group.add_argument("--account", help="Default Codex credential label/id/account_id")
+    account_group.add_argument("--account", default=os.getenv("CODEX_PROXY_ACCOUNT"), help="Default Codex credential label/id/account_id (env: CODEX_PROXY_ACCOUNT)")
     account_group.add_argument("--select-account", action="store_true", help="Interactively select the default Codex account")
-    p.add_argument("--account-order", help="Comma-separated failover order by label/id/account_id")
+    p.add_argument("--account-order", default=os.getenv("CODEX_PROXY_ACCOUNT_ORDER"), help="Comma-separated failover order by label/id/account_id (env: CODEX_PROXY_ACCOUNT_ORDER)")
+    p.add_argument("--no-failover", action="store_true", help="Use only the selected account(s); never roll over to other accounts (errors surface to the client instead)")
     p.add_argument("--import-codex-auth", action="store_true", help="Copy existing Codex CLI auth into Hermes and exit")
     p.add_argument("--codex-oauth-auth", action="store_true", help="Run a fresh Codex OAuth device-code login into Hermes and exit")
     p.add_argument("--serve-after-import", action="store_true", help="Start the proxy after --import-codex-auth")
@@ -1364,6 +1644,7 @@ def main() -> int:
     p.add_argument("--import-only", action="store_true", help="Deprecated alias for --import-codex-auth")
     p.add_argument("--label", help="Label for imported Codex CLI auth")
     p.add_argument("--codex-home", action="append", metavar="DIR", help="Codex CLI login dir to import/auto-sync from (repeatable). Overrides CODEX_PROXY_CODEX_HOMES. Default: $CODEX_HOME or ~/.codex")
+    p.add_argument("--grok-home", action="append", metavar="DIR", help="Grok CLI login dir for `grok` models (repeatable; first is the default, pick another per request with X-Grok-Home). Overrides GROK_PROXY_GROK_HOMES. Default: $GROK_HOME or ~/.grok")
     p.add_argument("--no-auto-sync-codex-cli-auth", action="store_true", help="Do not auto-copy Codex CLI auth while serving")
     p.add_argument("--remove-stale-oauth-configs", action="store_true", help="Remove stale Codex OAuth credentials from the Hermes pool and exit")
     p.add_argument("--dry-run", action="store_true", help="Show what --remove-stale-oauth-configs would remove")
@@ -1373,8 +1654,12 @@ def main() -> int:
     args = p.parse_args()
     if args.no_auto_sync_codex_cli_auth:
         AUTO_SYNC_CLI_AUTH = False
+    if args.no_failover:
+        NO_FAILOVER = True
     if args.codex_home:
         CODEX_HOME_DIRS[:] = [str(Path(d).expanduser()) for d in args.codex_home]
+    if args.grok_home:
+        GROK_HOME_DIRS[:] = [str(Path(d).expanduser()) for d in args.grok_home]
     if args.remove_stale_oauth_configs:
         print(remove_stale_oauth_configs(dry_run=args.dry_run), file=sys.stderr)
         return 0
@@ -1394,7 +1679,10 @@ def main() -> int:
             # A single --label is ambiguous across multiple dirs, so only apply it
             # when importing from exactly one.
             label = args.label if len(homes) == 1 else None
-            print(import_codex_cli_auth(label, codex_home=home), file=sys.stderr)
+            try:
+                print(import_codex_cli_auth(label, codex_home=home), file=sys.stderr)
+            except Exception as exc:
+                print(f"Skipping {home or '~/.codex'}: {exc}", file=sys.stderr)
     if (args.import_codex_auth or args.import_only) and not args.serve_after_import:
         return 0
     if args.select_account:
@@ -1409,6 +1697,15 @@ def main() -> int:
     server.account_order = args.account_order
     print(f"Listening on http://{args.host}:{args.port}/v1", file=sys.stderr)
     print("Endpoints: /v1/responses, /v1/responses/*, /v1/chat/completions, /v1/models, /accounts, /health", file=sys.stderr)
+    try:
+        # Read only — never grok_cred() here, which would refresh and rewrite
+        # the user's auth.json as a side effect of printing a status line.
+        home = GROK_HOME_DIRS[0] if GROK_HOME_DIRS else "~/.grok"
+        _, _, entry = _read_grok_auth(home)
+        label = str(entry.get("email") or "").strip() or _label_for_home(home) or "grok"
+        print(f"Grok Build: {label} via {GROK_BASE_URL} (send model 'grok')", file=sys.stderr)
+    except Exception as exc:
+        print(f"Grok Build: unavailable ({exc})", file=sys.stderr)
     if args.account:
         print(f"Default account: {args.account}", file=sys.stderr)
     if args.account_order:
