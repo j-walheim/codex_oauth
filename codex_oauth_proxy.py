@@ -64,7 +64,10 @@ sys.path.insert(0, str(ROOT))
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 HOP = {"host", "content-length", "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "trailers", "transfer-encoding", "upgrade", "authorization", "x-hermes-codex-account"}
-CODEX_DROP_FIELDS = {"context_management", "max_completion_tokens", "max_output_tokens", "max_tokens", "metadata", "previous_response_id", "prompt_cache_retention", "safety_identifier", "stream_options", "temperature", "text", "top_k", "top_p", "truncation", "user"}
+# context_management is deliberately NOT dropped: the backend accepts
+# {"type": "compaction"} now (verified 2026-08-17) and clients rely on it
+# for server-side compaction of long sessions.
+CODEX_DROP_FIELDS = {"max_completion_tokens", "max_output_tokens", "max_tokens", "metadata", "previous_response_id", "prompt_cache_retention", "safety_identifier", "stream_options", "temperature", "text", "top_k", "top_p", "truncation", "user"}
 FAILOVER_STATUS = {401, 402, 403, 429}
 REASONING_SUFFIXES = {
     "minimal": "minimal",
