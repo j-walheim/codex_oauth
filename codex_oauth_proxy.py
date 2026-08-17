@@ -99,10 +99,17 @@ def _parse_codex_homes(raw: str | None) -> list[str]:
 # want to flip between. Override via CODEX_PROXY_CODEX_HOMES (comma-separated) or
 # one/more --codex-home flags. Each dir is a separate Codex login
 # (`CODEX_HOME=<dir> codex login`).
-_DEFAULT_CODEX_HOMES = "~/.codex,~/.codex-acct-jonas,~/.codex-acct-nives"
+_DEFAULT_CODEX_HOMES = "~/.codex,~/.codex-acct-jonas,~/.codex-acct-nives,~/.codex-acct-ai"
 CODEX_HOME_DIRS: list[str] = _parse_codex_homes(
     os.getenv("CODEX_PROXY_CODEX_HOMES") or _DEFAULT_CODEX_HOMES
 )
+
+# Account the proxy prefers when neither --account/--select-account nor
+# --account-order is given: its label leads the failover order, so it's tried
+# first and the other logins back it up. Labels are auto-derived from the
+# CODEX_HOME dir name (e.g. `~/.codex-acct-work` -> `codex-acct-work`). Set via
+# CODEX_PROXY_ACCOUNT in .env; leave unset to fall back to the pool's own pick.
+DEFAULT_ACCOUNT = os.getenv("CODEX_PROXY_ACCOUNT", "").strip()
 
 # Auto-sync each Codex login dir at most once per this interval, and stagger the
 # dirs evenly across it so two accounts never refresh in the same window (e.g.
@@ -885,6 +892,53 @@ def _delete_entries_by_id(pool: object, ids: set[str]) -> int:
     return removed
 
 
+def reset_cooldowns(selector: str | None = None) -> str:
+    """Clear the 429 exhaustion cooldown on Codex credentials.
+
+    A 429 freezes an entry until the `resets_at` the backend reported, and
+    ChatGPT's is pessimistic — a weekly team limit routinely frees up days
+    before the timestamp it handed out, leaving the account invisible to
+    `--select-account` and to failover the whole time.
+
+    Clearing is deliberately unconditional: the health probe hits /models,
+    which answers 200 even while the account is quota-blocked, so there is no
+    cheap way to tell a stale cooldown from a live one. The cost of guessing
+    wrong is one request that 429s and re-marks the entry via mark_exhausted(),
+    so an over-eager reset self-corrects; an unnecessary week of lockout does
+    not. Pass *selector* (id/label/user_id/email/account_id) to reset one entry.
+    """
+    from agent.credential_pool import load_pool, STATUS_EXHAUSTED, STATUS_OK
+
+    pool = load_pool("openai-codex")
+    entries = pool.entries()
+    if not entries:
+        return "No Codex credentials to reset."
+    if selector and not any(_matches(e, selector) for e in entries):
+        return f"No Codex account matching {selector!r}; nothing reset."
+
+    cleared: list[str] = []
+    updated = []
+    for entry in entries:
+        frozen = getattr(entry, "last_status", None) == STATUS_EXHAUSTED or getattr(entry, "last_error_reset_at", None)
+        if frozen and (selector is None or _matches(entry, selector)):
+            cleared.append(str(getattr(entry, "label", "") or getattr(entry, "id", "")))
+            entry = replace(
+                entry,
+                last_status=STATUS_OK,
+                last_status_at=None,
+                last_error_code=None,
+                last_error_reason=None,
+                last_error_message=None,
+                last_error_reset_at=None,
+            )
+        updated.append(entry)
+    if not cleared:
+        return "No Codex credentials were in cooldown."
+    pool._entries = updated
+    pool._persist()
+    return f"Reset cooldown on {len(cleared)} Codex credential(s): {', '.join(cleared)}"
+
+
 def _prompt_yes_no(question: str) -> bool:
     while True:
         print(f"{question} [y/N]: ", end="", file=sys.stderr, flush=True)
@@ -1651,6 +1705,7 @@ def main() -> int:
     p.add_argument("--check-credentials", action="store_true", help="Probe each Codex credential against the backend, report health (ok/invalidated/expired), and exit")
     p.add_argument("--prune-credentials", action="store_true", help="Probe credentials and interactively delete dead (invalidated/expired) ones, then exit")
     p.add_argument("--yes", "-y", action="store_true", help="With --prune-credentials, delete all dead credentials without prompting")
+    p.add_argument("--reset-cooldown", nargs="?", const="", metavar="ACCOUNT", help="Clear the 429 usage-limit cooldown on all Codex credentials (or one, by label/id/email) before doing anything else, then continue")
     args = p.parse_args()
     if args.no_auto_sync_codex_cli_auth:
         AUTO_SYNC_CLI_AUTH = False
@@ -1660,6 +1715,10 @@ def main() -> int:
         CODEX_HOME_DIRS[:] = [str(Path(d).expanduser()) for d in args.codex_home]
     if args.grok_home:
         GROK_HOME_DIRS[:] = [str(Path(d).expanduser()) for d in args.grok_home]
+    # First, so a stale cooldown can't hide an account from the health report,
+    # the interactive picker, or the failover order below.
+    if args.reset_cooldown is not None:
+        print(reset_cooldowns(args.reset_cooldown or None), file=sys.stderr)
     if args.remove_stale_oauth_configs:
         print(remove_stale_oauth_configs(dry_run=args.dry_run), file=sys.stderr)
         return 0
@@ -1687,6 +1746,8 @@ def main() -> int:
         return 0
     if args.select_account:
         args.account = select_account_interactively()
+    elif not args.account and not args.account_order and DEFAULT_ACCOUNT:
+        args.account = DEFAULT_ACCOUNT
     try:
         server = ThreadingHTTPServer((args.host, args.port), Handler)
     except OSError as e:
