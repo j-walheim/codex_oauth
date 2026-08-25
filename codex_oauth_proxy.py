@@ -27,6 +27,11 @@ def debug(msg: str) -> None:
         print(msg, file=sys.stderr, flush=True)
 
 
+def warn(msg: str) -> None:
+    """Unconditional stderr logging for upstream failures, independent of CODEX_PROXY_DEBUG."""
+    print(f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] {msg}", file=sys.stderr, flush=True)
+
+
 def _load_dotenv(path: Path) -> None:
     if not path.is_file():
         return
@@ -69,6 +74,11 @@ HOP = {"host", "content-length", "connection", "keep-alive", "proxy-authenticate
 # for server-side compaction of long sessions.
 CODEX_DROP_FIELDS = {"max_completion_tokens", "max_output_tokens", "max_tokens", "metadata", "previous_response_id", "prompt_cache_retention", "safety_identifier", "stream_options", "temperature", "text", "top_k", "top_p", "truncation", "user"}
 FAILOVER_STATUS = {401, 402, 403, 429}
+# Backend/network failures worth retrying on the next account: these aren't
+# account-exhaustion signals (no mark_exhausted cooldown), just transient
+# breakage that another account's upstream connection may not share.
+FAILOVER_TRANSIENT_STATUS = {500, 502, 503, 504}
+FAILOVER_TRANSIENT_EXCEPTIONS = (httpx.TransportError,)  # covers TimeoutException, ConnectError, etc.
 REASONING_SUFFIXES = {
     "minimal": "minimal",
     "low": "low",
@@ -1437,7 +1447,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt: str, *args: object) -> None:
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        sys.stderr.write("%s %s - %s\n" % (ts, self.address_string(), fmt % args))
+        acct = getattr(self, "_log_account", None) or "-"
+        sys.stderr.write("%s %s %s - %s\n" % (ts, self.address_string(), acct, fmt % args))
 
     def json(self, status: int, obj: object, extra: dict[str, str] | None = None) -> None:
         body = _b(obj)
@@ -1491,6 +1502,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health":
             try:
                 c = resolve_cred(self.account())
+                self._log_account = c.label
                 self.json(200, {"status": "ok", "account": c.label})
             except Exception as e:
                 self.json(401, {"status": "error", "error": str(e)})
@@ -1515,6 +1527,7 @@ class Handler(BaseHTTPRequestHandler):
         """
         try:
             c = grok_cred(self.headers.get("X-Grok-Home"))
+            self._log_account = c.label
             headers = _req_headers(self.headers.items())
             headers.update(c.headers)
             headers["Authorization"] = f"Bearer {c.token}"
@@ -1541,6 +1554,8 @@ class Handler(BaseHTTPRequestHandler):
         except BrokenPipeError:
             return
         except Exception as e:
+            acct = getattr(self, "_log_account", None) or "unknown"
+            warn(f"grok {rel}: account {acct} giving up, returning 502 to client ({type(e).__name__}: {e})")
             self.json(502, {"error": {"message": str(e), "code": "grok_proxy_error"}})
 
     def upstream_headers(self, c: Cred, req: dict[str, Any] | None = None) -> dict[str, str]:
@@ -1584,6 +1599,8 @@ class Handler(BaseHTTPRequestHandler):
                 for idx, c in enumerate(creds):
                     query = urlsplit(self.path).query or ("client_version=1.0.0" if rel == "/models" else "")
                     url = urlunsplit(("", "", f"{c.base_url}{rel}", query, ""))
+                    response_started = False
+                    self._log_account = c.label
                     try:
                         if rel == "/responses" and not downstream_stream and self.command != "GET":
                             payload = collect_responses_stream(client, url, req or {}, self.upstream_headers(c, req))
@@ -1593,9 +1610,14 @@ class Handler(BaseHTTPRequestHandler):
                             if r.status_code in FAILOVER_STATUS and idx + 1 < len(creds):
                                 mark_exhausted(c, r.status_code, r.text[:500])
                                 continue
+                            if r.status_code in FAILOVER_TRANSIENT_STATUS and idx + 1 < len(creds):
+                                r.read()
+                                warn(f"pass_through {rel}: account {c.label} returned {r.status_code}, trying next account ({len(creds) - idx - 1} remaining)")
+                                continue
                             if r.status_code >= 400:
                                 r.read()
                                 debug(f"upstream {url} status={r.status_code} body={r.text}")
+                            response_started = True
                             self.send_response(r.status_code)
                             for k, v in _resp_headers(r.headers):
                                 self.send_header(k, v)
@@ -1610,6 +1632,19 @@ class Handler(BaseHTTPRequestHandler):
                         if status in FAILOVER_STATUS and idx + 1 < len(creds):
                             mark_exhausted(c, status, str(e)[:500])
                             continue
+                        if status in FAILOVER_TRANSIENT_STATUS and not response_started and idx + 1 < len(creds):
+                            warn(f"pass_through {rel}: account {c.label} got upstream status {status}, trying next account ({len(creds) - idx - 1} remaining)")
+                            continue
+                        raise
+                    except FAILOVER_TRANSIENT_EXCEPTIONS as e:
+                        if not response_started and idx + 1 < len(creds):
+                            warn(f"pass_through {rel}: account {c.label} failed with {type(e).__name__}: {e}, trying next account ({len(creds) - idx - 1} remaining)")
+                            continue
+                        raise
+                    except RuntimeError as e:
+                        if not response_started and idx + 1 < len(creds):
+                            warn(f"pass_through {rel}: account {c.label} stream error {e}, trying next account ({len(creds) - idx - 1} remaining)")
+                            continue
                         raise
         except BrokenPipeError:
             return
@@ -1620,8 +1655,12 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 text = e.response.text if e.response is not None else str(e)
                 payload = {"error": {"message": text, "code": "upstream_error"}}
+            acct = getattr(self, "_log_account", None) or "unknown"
+            warn(f"pass_through {rel}: account {acct} giving up, returning {status} to client ({e})")
             self.json(status, payload)
         except Exception as e:
+            acct = getattr(self, "_log_account", None) or "unknown"
+            warn(f"pass_through {rel}: account {acct} giving up, returning 502 to client ({type(e).__name__}: {e})")
             self.json(502, {"error": {"message": str(e), "code": "proxy_error"}})
 
     def chat(self) -> None:
@@ -1636,9 +1675,10 @@ class Handler(BaseHTTPRequestHandler):
             with httpx.Client(timeout=httpx.Timeout(300, connect=15)) as client:
                 creds = resolve_creds(self.account(), self.account_order())
                 for idx, c in enumerate(creds):
+                    started = False
+                    self._log_account = c.label
                     try:
                         if downstream_stream:
-                            started = False
 
                             def start_stream() -> None:
                                 nonlocal started
@@ -1671,6 +1711,19 @@ class Handler(BaseHTTPRequestHandler):
                         if status in FAILOVER_STATUS and idx + 1 < len(creds):
                             mark_exhausted(c, status, str(e)[:500])
                             continue
+                        if status in FAILOVER_TRANSIENT_STATUS and not started and idx + 1 < len(creds):
+                            warn(f"chat: account {c.label} got upstream status {status}, trying next account ({len(creds) - idx - 1} remaining)")
+                            continue
+                        raise
+                    except FAILOVER_TRANSIENT_EXCEPTIONS as e:
+                        if not started and idx + 1 < len(creds):
+                            warn(f"chat: account {c.label} failed with {type(e).__name__}: {e}, trying next account ({len(creds) - idx - 1} remaining)")
+                            continue
+                        raise
+                    except RuntimeError as e:
+                        if not started and idx + 1 < len(creds):
+                            warn(f"chat: account {c.label} stream error {e}, trying next account ({len(creds) - idx - 1} remaining)")
+                            continue
                         raise
         except httpx.HTTPStatusError as e:
             status = e.response.status_code if e.response is not None else 502
@@ -1678,8 +1731,12 @@ class Handler(BaseHTTPRequestHandler):
                 payload = e.response.json() if e.response is not None else {"error": {"message": str(e)}}
             except Exception:
                 payload = {"error": {"message": str(e), "code": "upstream_error"}}
+            acct = getattr(self, "_log_account", None) or "unknown"
+            warn(f"chat: account {acct} giving up, returning {status} to client ({e})")
             self.json(status, payload)
         except Exception as e:
+            acct = getattr(self, "_log_account", None) or "unknown"
+            warn(f"chat: account {acct} giving up, returning 502 to client ({type(e).__name__}: {e})")
             self.json(502, {"error": {"message": str(e), "code": "proxy_error"}})
 
 
