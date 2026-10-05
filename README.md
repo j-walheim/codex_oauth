@@ -227,6 +227,28 @@ The proxy tries accounts in order. If Codex returns `401`, `402`, `403`, or `429
 
 If Codex includes quota reset metadata, the proxy stores that reset time so Hermes can avoid the exhausted credential until the cooldown expires.
 
+## Track Codex Quota
+
+`/accounts` includes each login's live primary and secondary quota windows,
+their used percentages, and reset times. Fetch a snapshot from the command line:
+
+```bash
+python codex_oauth_proxy.py --check-quota
+```
+
+To stop routing requests to any account when either quota window reaches a
+chosen usage percentage, set a limit in `.env`:
+
+```text
+CODEX_PROXY_MAX_QUOTA_USED_PERCENT=80
+```
+
+Or pass `--max-quota-used-percent 80` when starting the proxy. Accounts at or
+above the limit are skipped, allowing failover to another account below the
+limit. If quota status cannot be fetched while this guard is enabled, that
+account is skipped until its status can be checked. The guard is disabled by
+default; use `--no-quota-limit` to override a configured limit for one run.
+
 ## Responses API Example
 
 ```bash

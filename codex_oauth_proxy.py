@@ -92,6 +92,23 @@ REASONING_SUFFIXES = {
 
 AUTO_SYNC_CLI_AUTH = os.getenv("CODEX_PROXY_AUTO_SYNC_CLI_AUTH", "1").strip().lower() not in {"0", "false", "no", "off"}
 
+def _quota_percent(value: str | float | int | None) -> float | None:
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        percent = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Codex quota limit must be a percentage from 0 to 100") from exc
+    if not 0 <= percent <= 100:
+        raise ValueError("Codex quota limit must be a percentage from 0 to 100")
+    return percent
+
+
+MAX_QUOTA_USED_PERCENT = _quota_percent(os.getenv("CODEX_PROXY_MAX_QUOTA_USED_PERCENT"))
+CODEX_QUOTA_USAGE_URL = os.getenv(
+    "CODEX_PROXY_QUOTA_USAGE_URL", "https://chatgpt.com/backend-api/wham/usage"
+).rstrip("/")
+
 # When set, a request only ever uses the explicitly selected account(s) (via
 # --account/--select-account/--account-order or the X-Hermes-Codex-Account
 # header). The usual "queue every other account behind the primary as failover"
@@ -112,7 +129,7 @@ def _parse_codex_homes(raw: str | None) -> list[str]:
 # want to flip between. Override via CODEX_PROXY_CODEX_HOMES (comma-separated) or
 # one/more --codex-home flags. Each dir is a separate Codex login
 # (`CODEX_HOME=<dir> codex login`).
-_DEFAULT_CODEX_HOMES = "~/.codex,~/.codex-acct-jonas,~/.codex-acct-nives,~/.codex-acct-ai"
+_DEFAULT_CODEX_HOMES = "~/.codex,~/.codex-acct-jonas,~/.codex-acct-nives,~/.codex-acct-ai,~/.codex-acct-pro"
 CODEX_HOME_DIRS: list[str] = _parse_codex_homes(
     os.getenv("CODEX_PROXY_CODEX_HOMES") or _DEFAULT_CODEX_HOMES
 )
@@ -307,6 +324,99 @@ def _jwt_identity(token: str) -> dict[str, str]:
         return {}
 
 
+def codex_quota(entry: object) -> dict[str, Any]:
+    """Fetch this Codex account's current plan quota windows."""
+    token = str(getattr(entry, "access_token", "") or "").strip()
+    account_id = _jwt_account_id(token)
+    if not token or not account_id:
+        return {"available": False, "error": "missing token or ChatGPT account ID"}
+    try:
+        from agent.auxiliary_client import _codex_cloudflare_headers
+
+        headers = _codex_cloudflare_headers(token)
+        headers["Authorization"] = f"Bearer {token}"
+        headers["ChatGPT-Account-Id"] = account_id
+        with httpx.Client(timeout=httpx.Timeout(10, connect=5), follow_redirects=False) as client:
+            response = client.get(CODEX_QUOTA_USAGE_URL, headers=headers)
+        if response.status_code != 200:
+            return {"available": False, "error": f"quota endpoint returned HTTP {response.status_code}"}
+        payload = response.json()
+        rate_limit = payload.get("rate_limit") or {}
+        windows: dict[str, dict[str, Any]] = {}
+        for window_name in ("primary_window", "secondary_window"):
+            window = rate_limit.get(window_name)
+            if not isinstance(window, dict):
+                continue
+            used = window.get("used_percent")
+            if used is None:
+                continue
+            try:
+                used = float(used)
+            except (TypeError, ValueError):
+                continue
+            windows[window_name.removesuffix("_window")] = {
+                "used_percent": used,
+                "limit_window_seconds": window.get("limit_window_seconds"),
+                "reset_at": window.get("reset_at"),
+                "reset_after_seconds": window.get("reset_after_seconds"),
+            }
+        spend_control = payload.get("spend_control") or {}
+        individual_limit = spend_control.get("individual_limit") or {}
+        if individual_limit.get("used_percent") is not None:
+            try:
+                windows["spend"] = {
+                    "used_percent": float(individual_limit["used_percent"]),
+                    "limit_window_seconds": None,
+                    "reset_at": individual_limit.get("reset_at"),
+                    "reset_after_seconds": individual_limit.get("reset_after_seconds"),
+                }
+            except (TypeError, ValueError):
+                pass
+        available = bool(windows) or bool(rate_limit.get("limit_reached")) or bool(spend_control.get("reached"))
+        result: dict[str, Any] = {
+            "available": available,
+            "plan_type": payload.get("plan_type") or "",
+            "limit_reached": bool(rate_limit.get("limit_reached", False) or spend_control.get("reached", False)),
+            "windows": windows,
+            "checked_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        if not available:
+            result["error"] = "quota response contained no rate limit windows"
+        return result
+    except Exception as exc:
+        return {"available": False, "error": f"{type(exc).__name__}: {exc}"[:200]}
+
+
+def _quota_block_reason(snapshot: dict[str, Any]) -> str | None:
+    limit = MAX_QUOTA_USED_PERCENT
+    if limit is None:
+        return None
+    if not snapshot.get("available"):
+        return "quota status unavailable"
+    if snapshot.get("limit_reached"):
+        return "Codex reports the quota is exhausted"
+    for name, window in (snapshot.get("windows") or {}).items():
+        used = window.get("used_percent")
+        if used is not None and float(used) >= limit:
+            return f"{name} window at {float(used):g}% (limit {limit:g}%)"
+    return None
+
+
+def _entries_under_quota(entries: list[object]) -> tuple[list[object], dict[str, dict[str, Any]]]:
+    """Return entries below the configured quota cap and their live snapshots."""
+    if MAX_QUOTA_USED_PERCENT is None:
+        return entries, {}
+    snapshots: dict[str, dict[str, Any]] = {}
+    allowed: list[object] = []
+    for entry in entries:
+        cid = str(getattr(entry, "id", ""))
+        snapshot = codex_quota(entry)
+        snapshots[cid] = snapshot
+        if _quota_block_reason(snapshot) is None:
+            allowed.append(entry)
+    return allowed, snapshots
+
+
 def _matches(entry: object, selector: str) -> bool:
     wanted = selector.strip().lower()
     token = str(getattr(entry, "access_token", "") or "")
@@ -363,21 +473,37 @@ def resolve_cred(account: str | None = None) -> Cred:
     pool = load_pool("openai-codex")
     if account:
         available = pool._available_entries(clear_expired=True, refresh=True)
+        available, _ = _entries_under_quota(available)
         entry = next((e for e in available if _matches(e, account)), None)
         if entry is None:
             if _auto_sync_codex_cli_auth():
                 pool = load_pool("openai-codex")
                 available = pool._available_entries(clear_expired=True, refresh=True)
+                available, _ = _entries_under_quota(available)
                 entry = next((e for e in available if _matches(e, account)), None)
             if entry is None:
                 known = ", ".join(f"{e.label or e.id} ({e.id})" for e in pool.entries()) or "none"
                 raise RuntimeError(f"No available Codex account matching {account!r}. Known: {known}")
         pool.acquire_lease(entry.id)
     else:
-        entry = pool.select()
+        if MAX_QUOTA_USED_PERCENT is None:
+            entry = pool.select()
+        else:
+            available = pool._available_entries(clear_expired=True, refresh=True)
+            available, _ = _entries_under_quota(available)
+            entry = available[0] if available else None
+            if entry is not None:
+                pool.acquire_lease(entry.id)
         if entry is None and _auto_sync_codex_cli_auth():
             pool = load_pool("openai-codex")
-            entry = pool.select()
+            if MAX_QUOTA_USED_PERCENT is None:
+                entry = pool.select()
+            else:
+                available = pool._available_entries(clear_expired=True, refresh=True)
+                available, _ = _entries_under_quota(available)
+                entry = available[0] if available else None
+                if entry is not None:
+                    pool.acquire_lease(entry.id)
     if entry is None:
         raise RuntimeError("No Codex credentials. Run `hermes auth add openai-codex`.")
     return _cred_from_entry(entry)
@@ -402,6 +528,7 @@ def resolve_creds(account: str | None = None, order: str | None = None) -> list[
     def snapshot() -> list[Cred]:
         pool = load_pool("openai-codex")
         available = pool._available_entries(clear_expired=True, refresh=True)
+        available, _ = _entries_under_quota(available)
         picked: list[Cred] = []
         seen: set[str] = set()
 
@@ -415,7 +542,7 @@ def resolve_creds(account: str | None = None, order: str | None = None) -> list[
             if entry is not None:
                 take(entry)
         if not selectors:
-            primary = pool.select()
+            primary = pool.select() if MAX_QUOTA_USED_PERCENT is None else (available[0] if available else None)
             if primary is not None and primary.id not in seen:
                 take(primary)
         if not NO_FAILOVER:
@@ -454,14 +581,24 @@ def error_context(message: str) -> dict[str, Any]:
 
 
 def mark_exhausted(c: Cred, status: int, message: str = "") -> None:
+    """Freeze `c` until its credits reset. Never raises.
+
+    Callers use this from inside a failover loop whose own `except RuntimeError`
+    means "stream broke, roll over", so an exception escaping here would be
+    indistinguishable from an upstream failure. Losing a cooldown should cost one
+    wasted retry, not corrupt the loop's control flow.
+    """
     from agent.credential_pool import load_pool
 
     if c.provider != "openai-codex":
         return
-    pool = load_pool("openai-codex")
-    entry = next((e for e in pool.entries() if e.id == c.cid), None)
-    if entry is not None:
-        pool._mark_exhausted(entry, status, error_context(message))
+    try:
+        pool = load_pool("openai-codex")
+        entry = next((e for e in pool.entries() if e.id == c.cid), None)
+        if entry is not None:
+            pool._mark_exhausted(entry, status, error_context(message))
+    except Exception as e:
+        warn(f"could not record {status} cooldown for account {c.label}: {type(e).__name__}: {e}")
 
 
 def grok_headers() -> dict[str, str]:
@@ -589,12 +726,22 @@ def import_codex_cli_auth(label: str | None = None, codex_home: str | None = Non
     pool = load_pool("openai-codex")
     user_key = _jwt_user_key(tokens["access_token"])
     refresh_token = tokens.get("refresh_token")
+    name = (
+        label
+        or _label_for_home(codex_home)
+        or label_from_token(tokens["access_token"], f"codex-cli-{len(pool.entries()) + 1}")
+    )
     for entry in pool.entries():
         same_pair = entry.access_token == tokens["access_token"] or (
             bool(refresh_token) and entry.refresh_token == refresh_token
         )
         if not same_pair:
             continue
+        if codex_home and entry.source == "manual:codex_cli_import" and entry.label != name:
+            updated = replace(entry, label=name)
+            pool._replace_entry(entry, updated)
+            pool._persist()
+            return _with_identity(f"Renamed Codex CLI auth to {updated.label!r} ({updated.id})", updated.access_token)
         if entry.last_status:
             updated = replace(
                 entry,
@@ -610,14 +757,12 @@ def import_codex_cli_auth(label: str | None = None, codex_home: str | None = Non
             return _with_identity(f"Codex CLI auth refreshed for {updated.label!r} ({updated.id})", updated.access_token)
         return _with_identity(f"Codex CLI auth already present as {entry.label!r} ({entry.id})", entry.access_token)
 
-    # Match the entry to update by USER (not the org account_id, which every
-    # Team member shares) so importing a different user creates its own entry
-    # instead of clobbering an existing one. Fall back to the source marker only
-    # when the token carries no decodable user identity.
+    # Each Codex home is a distinct login slot. Match refreshes to that slot's
+    # label so two plans/workspaces for the same user don't overwrite each other.
     if user_key:
         manual_import = next(
             (entry for entry in pool.entries()
-             if _jwt_user_key(entry.access_token) == user_key),
+             if _jwt_user_key(entry.access_token) == user_key and entry.label == name),
             None,
         )
     else:
@@ -646,11 +791,6 @@ def import_codex_cli_auth(label: str | None = None, codex_home: str | None = Non
         _save_codex_tokens(tokens)
         return _with_identity(f"Updated Codex CLI auth for {updated.label!r} ({updated.id})", updated.access_token)
 
-    name = (
-        label
-        or _label_for_home(codex_home)
-        or label_from_token(tokens["access_token"], f"codex-cli-{len(pool.entries()) + 1}")
-    )
     entry = PooledCredential(
         provider="openai-codex",
         id=uuid.uuid4().hex[:6],
@@ -1040,6 +1180,8 @@ def accounts() -> list[dict[str, object]]:
     for e in pool.entries():
         status = e.last_status or "ok"
         ident = _jwt_identity(e.access_token)
+        quota = codex_quota(e)
+        quota_blocked = _quota_block_reason(quota)
         out.append({
             "id": e.id,
             "label": e.label,
@@ -1053,8 +1195,66 @@ def accounts() -> list[dict[str, object]]:
             "source": e.source,
             "status": status,
             "exhausted_until": _exhausted_until(e) if status == STATUS_EXHAUSTED else None,
+            "quota": quota,
+            "quota_limit_used_percent": MAX_QUOTA_USED_PERCENT,
+            "quota_block_reason": quota_blocked,
         })
     return out
+
+
+def _format_reset_remaining(window: dict[str, Any] | None) -> str:
+    if not window:
+        return "—"
+    remaining = window.get("reset_after_seconds")
+    if remaining is None and window.get("reset_at") is not None:
+        try:
+            remaining = float(window["reset_at"]) - time.time()
+        except (TypeError, ValueError):
+            return "—"
+    try:
+        seconds = max(0, int(float(remaining)))
+    except (TypeError, ValueError):
+        return "—"
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes = seconds // 60
+    return f"{days}d {hours}h" if days else (f"{hours}h {minutes}m" if hours else f"{minutes}m")
+
+
+def quota_table(records: list[dict[str, Any]] | None = None) -> str:
+    """Format live quota snapshots as the compact account table."""
+    records = accounts() if records is None else records
+    headers = ("Account", "5h remaining", "Weekly remaining", "Time to reset 5h", "Time to reset weekly")
+    rows: list[tuple[str, str, str, str, str]] = []
+    for record in records:
+        quota = record.get("quota") or {}
+        windows = quota.get("windows") or {}
+        short = windows.get("primary")
+        weekly = windows.get("secondary")
+        for window in windows.values():
+            length = window.get("limit_window_seconds")
+            if length is None:
+                continue
+            try:
+                if float(length) >= 86400:
+                    weekly = window
+                else:
+                    short = window
+            except (TypeError, ValueError):
+                continue
+        fmt_remaining = lambda window: f"{max(0, 100 - float(window['used_percent'])):g}%" if window and window.get("used_percent") is not None else "—"
+        rows.append((
+            str(record.get("label") or record.get("id") or "?"),
+            fmt_remaining(short),
+            fmt_remaining(weekly),
+            _format_reset_remaining(short),
+            _format_reset_remaining(weekly),
+        ))
+    widths = [max([len(headers[i]), *(len(row[i]) for row in rows)]) for i in range(len(headers))]
+    lines = ["  ".join(headers[i].ljust(widths[i]) for i in range(len(headers)))]
+    lines.append("  ".join("-" * widths[i] for i in range(len(headers))))
+    lines.extend("  ".join(row[i].ljust(widths[i]) for i in range(len(headers))) for row in rows)
+    return "\n".join(lines)
 
 
 def select_account_interactively() -> str:
@@ -1291,7 +1491,11 @@ def apply_codex_defaults(req: dict[str, Any]) -> dict[str, Any]:
         out.setdefault("include", [])
     else:
         effort = str(reasoning.get("effort") if isinstance(reasoning, dict) and reasoning.get("effort") else "medium")
-        out["reasoning"] = {"effort": "low" if effort == "minimal" else effort, "summary": "auto"}
+        out["reasoning"] = {
+            **(reasoning if isinstance(reasoning, dict) else {}),
+            "effort": "low" if effort == "minimal" else effort,
+        }
+        out["reasoning"].setdefault("summary", "auto")
         out.setdefault("include", ["reasoning.encrypted_content"])
     if out.get("tools") and "parallel_tool_calls" not in out:
         out["parallel_tool_calls"] = True
@@ -1608,7 +1812,13 @@ class Handler(BaseHTTPRequestHandler):
                             return
                         with client.stream(self.command, url, content=body, headers=self.upstream_headers(c, req), follow_redirects=False) as r:
                             if r.status_code in FAILOVER_STATUS and idx + 1 < len(creds):
+                                # r.read() first: `r` is an unread streaming
+                                # response, and touching .text without it raises
+                                # httpx.ResponseNotRead, which would skip the
+                                # cooldown entirely.
+                                r.read()
                                 mark_exhausted(c, r.status_code, r.text[:500])
+                                warn(f"pass_through {rel}: account {c.label} returned {r.status_code}, trying next account ({len(creds) - idx - 1} remaining)")
                                 continue
                             if r.status_code in FAILOVER_TRANSIENT_STATUS and idx + 1 < len(creds):
                                 r.read()
@@ -1742,6 +1952,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> int:
     global AUTO_SYNC_CLI_AUTH, NO_FAILOVER
+    global MAX_QUOTA_USED_PERCENT
 
     p = argparse.ArgumentParser(description="Local OpenAI-compatible proxy for Hermes Codex OAuth.")
     p.add_argument("--host", default=DEFAULT_HOST)
@@ -1760,6 +1971,10 @@ def main() -> int:
     p.add_argument("--codex-home", action="append", metavar="DIR", help="Codex CLI login dir to import/auto-sync from (repeatable). Overrides CODEX_PROXY_CODEX_HOMES. Default: $CODEX_HOME or ~/.codex")
     p.add_argument("--grok-home", action="append", metavar="DIR", help="Grok CLI login dir for `grok` models (repeatable; first is the default, pick another per request with X-Grok-Home). Overrides GROK_PROXY_GROK_HOMES. Default: $GROK_HOME or ~/.grok")
     p.add_argument("--no-auto-sync-codex-cli-auth", action="store_true", help="Do not auto-copy Codex CLI auth while serving")
+    quota_group = p.add_mutually_exclusive_group()
+    quota_group.add_argument("--max-quota-used-percent", type=_quota_percent, default=MAX_QUOTA_USED_PERCENT, metavar="PERCENT", help="Stop routing to an account when either Codex quota window reaches this usage percentage (env: CODEX_PROXY_MAX_QUOTA_USED_PERCENT)")
+    quota_group.add_argument("--no-quota-limit", action="store_true", help="Disable the Codex quota usage guard")
+    p.add_argument("--check-quota", action="store_true", help="Fetch and print live Codex quota windows for all accounts, then exit")
     p.add_argument("--remove-stale-oauth-configs", action="store_true", help="Remove stale Codex OAuth credentials from the Hermes pool and exit")
     p.add_argument("--dry-run", action="store_true", help="Show what --remove-stale-oauth-configs would remove")
     p.add_argument("--check-credentials", action="store_true", help="Probe each Codex credential against the backend, report health (ok/invalidated/expired), and exit")
@@ -1767,6 +1982,7 @@ def main() -> int:
     p.add_argument("--yes", "-y", action="store_true", help="With --prune-credentials, delete all dead credentials without prompting")
     p.add_argument("--reset-cooldown", nargs="?", const="", metavar="ACCOUNT", help="Clear the 429 usage-limit cooldown on all Codex credentials (or one, by label/id/email) before doing anything else, then continue")
     args = p.parse_args()
+    MAX_QUOTA_USED_PERCENT = None if args.no_quota_limit else args.max_quota_used_percent
     if args.no_auto_sync_codex_cli_auth:
         AUTO_SYNC_CLI_AUTH = False
     if args.no_failover:
@@ -1784,6 +2000,10 @@ def main() -> int:
         return 0
     if args.check_credentials:
         print(report_credential_health(), file=sys.stderr)
+        return 0
+    if args.check_quota:
+        _auto_sync_codex_cli_auth(force=True)
+        print(quota_table(), file=sys.stdout)
         return 0
     if args.prune_credentials:
         print(prune_credentials(assume_yes=args.yes), file=sys.stderr)
