@@ -32,6 +32,7 @@ Supported endpoints:
 ```text
 /v1/responses
 /v1/responses/*
+/v1/alpha/search
 /v1/chat/completions
 /v1/models
 /accounts
@@ -39,6 +40,8 @@ Supported endpoints:
 ```
 
 `/v1/responses/*` includes subpaths such as `/v1/responses/compact`.
+`/v1/alpha/search` forwards standalone Codex search requests and their structured
+source results through the selected Hermes-managed credential.
 
 The proxy does not require a real OpenAI API key from local clients. If a client library requires one, use any non-empty placeholder value.
 

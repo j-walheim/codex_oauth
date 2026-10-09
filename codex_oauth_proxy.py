@@ -1717,7 +1717,7 @@ class Handler(BaseHTTPRequestHandler):
         rel = _route_rel(path)
         if rel == "/chat/completions":
             return self.chat()
-        if rel == "/models" or _is_responses_path(rel):
+        if rel == "/models" or rel == "/alpha/search" or _is_responses_path(rel):
             return self.pass_through(rel)
         self.json(404, {"error": {"message": f"Unsupported path {path}", "code": "path_not_allowed"}})
 
