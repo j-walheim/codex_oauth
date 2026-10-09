@@ -32,6 +32,7 @@ Supported endpoints:
 ```text
 /v1/responses
 /v1/responses/*
+/v1/alpha/search
 /v1/chat/completions
 /v1/models
 /accounts
@@ -39,6 +40,8 @@ Supported endpoints:
 ```
 
 `/v1/responses/*` includes subpaths such as `/v1/responses/compact`.
+`/v1/alpha/search` forwards standalone Codex search requests and their structured
+source results through the selected Hermes-managed credential.
 
 The proxy does not require a real OpenAI API key from local clients. If a client library requires one, use any non-empty placeholder value.
 
@@ -226,6 +229,28 @@ curl http://127.0.0.1:8765/v1/responses \
 The proxy tries accounts in order. If Codex returns `401`, `402`, `403`, or `429`, the proxy marks that credential exhausted in the Hermes pool and retries the next account when possible.
 
 If Codex includes quota reset metadata, the proxy stores that reset time so Hermes can avoid the exhausted credential until the cooldown expires.
+
+## Track Codex Quota
+
+`/accounts` includes each login's live primary and secondary quota windows,
+their used percentages, and reset times. Fetch a snapshot from the command line:
+
+```bash
+python codex_oauth_proxy.py --check-quota
+```
+
+To stop routing requests to any account when either quota window reaches a
+chosen usage percentage, set a limit in `.env`:
+
+```text
+CODEX_PROXY_MAX_QUOTA_USED_PERCENT=80
+```
+
+Or pass `--max-quota-used-percent 80` when starting the proxy. Accounts at or
+above the limit are skipped, allowing failover to another account below the
+limit. If quota status cannot be fetched while this guard is enabled, that
+account is skipped until its status can be checked. The guard is disabled by
+default; use `--no-quota-limit` to override a configured limit for one run.
 
 ## Responses API Example
 
